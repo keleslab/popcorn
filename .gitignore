@@ -1,0 +1,9 @@
+.Rproj.user
+.Rhistory
+.RData
+.Ruserdata
+inst/doc
+docs
+
+# personal working notebook (kept locally, not part of the package)
+popcorn-intro-demo.ipynb

@@ -1,0 +1,361 @@
+---
+title: "Getting started with popcorn"
+output: rmarkdown::html_vignette
+vignette: >
+  %\VignetteIndexEntry{Getting started with popcorn}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+
+```{r, include = FALSE}
+knitr::opts_chunk$set(
+  collapse = TRUE,
+  comment = "#>"
+)
+```
+
+## What popcorn does
+
+Population-scale single-cell RNA-seq makes it possible to estimate not
+just one pooled gene co-expression network, but a separate network for
+every donor in a study. A donor-specific correlation estimated from a
+few hundred cells is noisy, so a difference between two donors at a
+given gene pair can reflect sampling noise rather than real biological
+heterogeneity.
+
+popcorn is a two-stage framework for estimating reliable donor-level
+co-expression:
+
+1. **Stage 1** fits a covariate-adjusted marginal model to each gene
+   (negative binomial by default) and converts each gene's counts to a
+   Gaussian-copula score, from which it computes a global correlation
+   (all cells pooled) and each donor's own raw correlation.
+2. **Stage 2** applies a random-effects variance decomposition that
+   separates genuine between-donor heterogeneity from sampling noise at
+   each gene pair, and adaptively shrinks each donor's noisy raw
+   correlation toward the global correlation by a ratio set by that
+   edge's estimated heterogeneity relative to the donor's own sampling
+   variance.
+
+This vignette runs the full pipeline, end to end, on a small simulated
+toy dataset -- not any of the real cohorts analyzed in the associated
+paper -- to show what popcorn's input and output look like.
+
+```{r setup}
+library(popcorn)
+suppressPackageStartupMessages(library(SingleCellExperiment))
+```
+
+## A toy dataset
+
+We simulate `r 4000` cells from `r 20` donors and `r 5` genes, using the
+same construction as the simulations in the associated paper (see its
+Methods): for each donor, draw Gaussian scores from a
+donor-specific correlation matrix, map them to the uniform scale, then
+quantile-transform to a negative binomial count whose mean depends on
+each cell's (simulated) library size.
+
+Four of the five genes share one correlation structure across every
+donor (no real donor-to-donor heterogeneity at those edges). The
+`g1`-`g2` edge is the exception: each donor's true correlation is an
+independent draw from a Normal distribution on the Fisher-z scale
+around a global value, `atanh(0.2)`, with variance `tau2_true = 0.05`
+-- the same mechanism the paper's simulations use to inject
+heterogeneity (random donor effects `u_de ~ N(0, tau2_e_true)` around a
+global correlation), not a hand-picked pattern.
+
+```{r simulate-data}
+set.seed(42)
+G <- 5
+donors <- paste0("D", 1:20)
+n_cells_per_donor <- 200
+D <- length(donors)
+N <- D * n_cells_per_donor
+gene_names <- paste0("g", 1:G)
+
+donor_id <- rep(donors, each = n_cells_per_donor)
+log1p_total_counts <- rnorm(N, mean = 7, sd = 0.3)
+
+# Shared ground-truth correlation: same for every donor at every edge
+# except g1-g2 (set per donor below).
+C_shared <- diag(G)
+C_shared[3, 4] <- C_shared[4, 3] <- 0.4
+
+# g1-g2: real donor-to-donor heterogeneity, drawn the same way the
+# paper's simulations inject it (u_de ~ N(0, tau2_e_true), added to the
+# global Fisher-z value) -- not a hand-picked two-value pattern.
+z_global_g1g2  <- fisher_z(0.2)
+tau2_true_g1g2 <- 0.05
+u_de           <- rnorm(D, mean = 0, sd = sqrt(tau2_true_g1g2))
+heterog_group  <- inv_fisher_z(z_global_g1g2 + u_de)
+names(heterog_group) <- donors
+
+mu_base <- c(30, 25, 40, 35, 20)
+theta_g <- c(4, 5, 6, 4, 5)
+
+counts <- matrix(0L, nrow = G, ncol = N, dimnames = list(gene_names, NULL))
+for (d in donors) {
+  idx_d <- which(donor_id == d)
+  C_d <- C_shared
+  C_d[1, 2] <- C_d[2, 1] <- heterog_group[d]
+  Z_d <- matrix(rnorm(length(idx_d) * G), nrow = length(idx_d), ncol = G) %*% chol(C_d)
+  U_d <- pnorm(Z_d)
+  for (g in seq_len(G)) {
+    mu_dig <- mu_base[g] * exp(log1p_total_counts[idx_d] - mean(log1p_total_counts))
+    counts[g, idx_d] <- qnbinom(U_d[, g], mu = mu_dig, size = theta_g[g])
+  }
+}
+```
+
+Each gene's counts are negative binomial, `NB(mu_dig, theta_g[g])`:
+`mu_base[g]` is the gene's baseline mean count (at the average cell's
+library size), scaled per cell by that cell's own
+`log1p_total_counts`; `theta_g[g]` is the gene's dispersion (smaller
+means more over-dispersed relative to a Poisson with the same mean).
+Both are set by hand here, not fit from real data:
+
+```{r gene-params}
+data.frame(
+  gene = gene_names,
+  mu_base = mu_base,
+  theta_g = theta_g,
+  empirical_mean = round(rowMeans(counts), 1),
+  empirical_var = round(apply(counts, 1, var), 1)
+)
+```
+
+popcorn takes a `SingleCellExperiment` as input, with covariates in
+`colData()`:
+
+```{r build-sce}
+cell_meta <- data.frame(
+  Donor = donor_id,
+  log1p_total_counts = log1p_total_counts,
+  row.names = paste0("cell", seq_len(N))
+)
+colnames(counts) <- rownames(cell_meta)
+sce <- SingleCellExperiment(assays = list(counts = counts), colData = cell_meta)
+sce
+```
+
+## Running the pipeline
+
+`run_coexp_pipeline()` runs both stages and writes every intermediate
+and final result under `comb_path`. We use a temporary directory here;
+in practice this should be a persistent location, since Stage 1's
+per-gene fits are the most expensive step and are cached (re-running
+with the same `comb_path` skips genes already fit).
+
+By default popcorn uses the asymptotic chi-squared null for the
+heterogeneity test (`evidence_p_method = "Q0_DL"`, used throughout the
+associated paper) and skips the simulation-based
+pseudo-donor null (`compute_Q0_sim = FALSE`). We set both explicitly
+below for clarity. If you do set `compute_Q0_sim = TRUE`, pseudo-donors
+are formed by partitioning cells into disjoint groups
+(`pseudo_donor_mode = "permutation"`), and setting
+`evidence_p_method = "Q0_sim"` without `compute_Q0_sim = TRUE` is an
+error rather than silently returning `NA` p-values.
+
+```{r run-pipeline, results = "hide"}
+comb_path <- file.path(tempdir(), "popcorn_vignette_demo")
+
+# Clear any earlier output at comb_path, so this chunk can be re-run after
+# changing the simulated dataset above (run_marginal_stage() refuses to
+# reuse a comb_path cached for a different sce).
+unlink(comb_path, recursive = TRUE)
+
+res <- run_coexp_pipeline(
+  sce = sce,
+  comb_path = comb_path,
+  gene_names = gene_names,
+  covariates = "log1p_total_counts",
+  mu_formula = "log1p_total_counts",
+  sigma_formula = "1",
+  family_use = "nb",
+  donor_col = "Donor",
+  n_cores_marginal = 1,
+  n_cores_split = 1,
+  n_cores_ewvds = 1,
+  donors = donors,
+  compute_Q0_sim = FALSE,
+  evidence_p_method = "Q0_DL",
+  do_estimate_lfdr = FALSE,
+  pipeline_tag = "vignette_demo"
+)
+```
+
+## Inspecting the output
+
+The main result is saved to `EWVDS_result.rds` under a
+`donor_network_EWVDS_<pipeline_tag>` subdirectory of `comb_path`. Its
+`edge_df` summarizes every gene pair's estimated donor heterogeneity,
+`tau2_e`, and the corresponding heterogeneity test p-value, `p_Q_e`.
+Because this is simulated data, we also know each edge's *true*
+between-donor heterogeneity, `true_tau2`, to check `tau2_e` against:
+for `g1`-`g2` this is the sample variance (Fisher-z scale, matching
+`tau2_e`'s own scale) of its 20 actual per-donor draws -- close to, but
+not exactly, the generating `tau2_true_g1g2 = 0.05`, since it is itself
+only a 20-donor estimate of that parameter; for every other edge, the
+true correlation is identical across donors by construction, so
+`true_tau2` is exactly `0`.
+
+```{r inspect-result}
+result <- readRDS(file.path(comb_path, "donor_network_EWVDS_vignette_demo", "EWVDS_result.rds"))
+
+true_tau2 <- function(gene_a, gene_b) {
+  if (gene_a == "g1" && gene_b == "g2") return(var(fisher_z(heterog_group)))
+  0
+}
+result$edge_df$true_tau2 <- mapply(true_tau2, result$edge_df$gene1, result$edge_df$gene2)
+
+result$edge_df[order(-result$edge_df$tau2_e), c("gene1", "gene2", "true_tau2", "tau2_e", "p_Q_e")]
+```
+
+`g1`-`g2` -- the one edge with real, injected donor heterogeneity --
+has by far the largest `true_tau2` and `tau2_e`, and the smallest
+`p_Q_e`, exactly as intended, and `tau2_e` recovers `true_tau2`
+reasonably well. Every other edge's `true_tau2` is `0`, and `tau2_e`
+is at or near `0` too.
+
+### True vs. estimated correlation
+
+Because this toy dataset is simulated, we know the *true* per-donor
+correlation that generated it. Following the recovery-plot style
+of the associated paper (one representative null edge and one
+representative signal edge, true vs. estimated correlation across
+donors), we pick one representative null edge (`g1`-`g3`) and
+the one edge with real donor heterogeneity (`g1`-`g2`), and for each,
+plot every donor's true correlation against its raw and its shrunk
+estimate side by side:
+
+```{r raw-correlation-helper}
+raw_correlation <- function(gene_a, gene_b) {
+  vapply(donors, function(d) {
+    Sigma_d <- as.matrix(read.csv(file.path(comb_path, "donors", d, "Sigma_Z.csv"),
+                                   row.names = 1, check.names = FALSE))
+    Sigma_d[gene_a, gene_b]
+  }, numeric(1))
+}
+
+true_correlation <- function(gene_a, gene_b, donor) {
+  if (gene_a == "g1" && gene_b == "g2") return(unname(heterog_group[donor]))
+  C_shared[match(gene_a, gene_names), match(gene_b, gene_names)]
+}
+
+edge_df <- result$edge_df
+true_mat <- raw_mat <- matrix(NA_real_, nrow(edge_df), length(donors), dimnames = list(NULL, donors))
+for (i in seq_len(nrow(edge_df))) {
+  ga <- edge_df$gene1[i]; gb <- edge_df$gene2[i]
+  raw_mat[i, ] <- raw_correlation(ga, gb)
+  for (d in donors) true_mat[i, d] <- true_correlation(ga, gb, d)
+}
+shrunk_mat <- result$R_DL_mat
+```
+
+```{r true-vs-estimated, fig.width = 12, fig.height = 12}
+plot_recovery_grid <- function(edge_row, row_label,
+                                main_cex = 1, axis_label_cex = 1,
+                                axis_tick_cex = 1, annotation_cex = 0.85) {
+  true_vals <- true_mat[edge_row, ]
+
+  panel <- function(est_vals, main) {
+    plot(true_vals, est_vals, pch = 16, col = "steelblue",
+         xlim = c(-1, 1), ylim = c(-1, 1),
+         xlab = "true correlation", ylab = "estimated correlation", main = main,
+         cex.main = main_cex, cex.lab = axis_label_cex, cex.axis = axis_tick_cex)
+    abline(0, 1, lty = 2, col = "red")
+    # r is undefined (NA) when true_vals has zero variance, e.g. a null edge
+    # whose true correlation is the same constant for every donor -- not a
+    # computation error, just say so instead of printing a bare "NA".
+    r_val    <- if (sd(true_vals) > 0) cor(true_vals, est_vals) else NA_real_
+    r_label  <- if (is.na(r_val)) "r = NA (true value constant)" else sprintf("r = %.3f", r_val)
+    rmse_val <- sqrt(mean((true_vals - est_vals)^2))
+    usr <- par("usr")
+    text(usr[1] + 0.03 * diff(usr[1:2]), usr[4] - 0.05 * diff(usr[3:4]),
+         labels = sprintf("%s\nRMSE = %.3f", r_label, rmse_val), adj = c(0, 1), cex = annotation_cex)
+  }
+
+  panel(raw_mat[edge_row, ],    sprintf("%s -- raw", row_label))
+  panel(shrunk_mat[edge_row, ], sprintf("%s -- shrunk", row_label))
+}
+
+null_edge_row   <- which(edge_df$gene1 == "g1" & edge_df$gene2 == "g3")
+signal_edge_row <- which(edge_df$gene1 == "g1" & edge_df$gene2 == "g2")
+
+old_par <- par(mfrow = c(2, 2), mar = c(5, 5, 3, 1), mgp = c(3, 0.8, 0))
+plot_recovery_grid(null_edge_row,   "null edge (g1-g3)",
+                    main_cex = 2, axis_label_cex = 2, axis_tick_cex = 2, annotation_cex = 2)
+plot_recovery_grid(signal_edge_row, "signal edge (g1-g2)",
+                    main_cex = 2, axis_label_cex = 2, axis_tick_cex = 2, annotation_cex = 2)
+par(old_par)
+```
+
+For both edges, the shrunk estimate's points sit closer to the `y = x`
+line than raw's, with a higher `r` and lower `RMSE` -- most dramatically
+at the null edge, where the raw correlation scatters widely around `0`
+purely from per-donor sampling noise and shrinkage pulls it back in; at
+the signal edge, both track the true, donor-specific value reasonably
+well, since there is genuine heterogeneity there to recover rather than
+noise to remove. The table below aggregates this same raw-vs-shrunk RMSE
+comparison across every edge and donor, not just these two examples:
+
+```{r rmse-summary}
+rmse <- function(est) sqrt(mean((as.vector(true_mat) - as.vector(est))^2))
+data.frame(estimator = c("raw", "popcorn"), rmse = c(rmse(raw_mat), rmse(shrunk_mat)))
+```
+
+## Recommended usage for real data
+
+The toy example above relies on `run_coexp_pipeline()`'s defaults
+(`covariates = "log1p_total_counts"`, `mu_formula = "log1p_total_counts"`)
+to get running with minimal setup. For real data, we recommend adjusting
+for technical and compositional covariates more fully -- this is the
+configuration used to produce the associated paper's results:
+
+```{r recommended-usage, eval = FALSE}
+# Illustrative only -- not run here. `sce` should already be subset to
+# a single cell type, with `counts` holding raw UMI counts and
+# `colData()` holding `log1p_total_counts` and `Donor`.
+run_coexp_pipeline(
+  sce           = sce,
+  comb_path     = "path/to/output/",
+  covariates    = c("log1p_total_counts", "Donor"),
+  mu_formula    = "log1p_total_counts + Donor",
+  sigma_formula = "1",
+  family_use    = "nb",
+  donor_col     = "Donor"
+)
+```
+
+`log1p_total_counts` adjusts for per-cell technical noise (library
+size); including `Donor` in `mu_formula` additionally adjusts the mean
+model itself for between-donor compositional differences, on top of
+Stage 2's own between-donor heterogeneity estimation.
+`noise_method`, `null_method`, `pseudo_donor_mode`, `compute_Q0_sim`,
+`evidence_p_method`, and `excess_variance_method` already default to the settings used
+throughout the associated paper, so they don't need to be set explicitly
+unless you want to change them. `celltype` never needs to be set
+either way -- see `?run_marginal_stage`.
+
+## A note on reproducibility
+
+popcorn's Stage 1 marginal fit uses a randomized probability-integral
+transform, so two unseeded runs on the same data give slightly
+different results. This is a deliberate statistical design choice, not
+a bug, and its effect on the final shrunk estimate is small relative to
+real heterogeneous edges. Pass `seed` to `run_coexp_pipeline()` (or
+`run_marginal_stage()`) to make a run exactly reproducible, including
+across repeated calls in one R session and across `n_cores_marginal`.
+A bare `set.seed()` before the call is enough only in a fresh R
+session, because the `parallel` package keeps the random-number stream
+it hands to forked workers across calls (see `?run_marginal_stage`).
+The results reported in the associated paper were generated before
+this option existed, so they can be reproduced only up to this small
+run-to-run variability. The paper's analysis code
+(<https://github.com/keleslab/popcorn-paper>) uses popcorn 0.1.1.
+
+## Session info
+
+```{r session-info}
+sessioninfo::session_info()
+```

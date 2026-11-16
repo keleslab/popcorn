@@ -1,0 +1,45 @@
+Package: popcorn
+Title: Population-Scale Personalized Coexpression Network Estimation
+Version: 0.1.1
+Authors@R: c(
+    person("Shuchen", "Yan", email = "syan58@wisc.edu", role = c("aut", "cre")),
+    person("Kris", "Sankaran", role = "aut"),
+    person("Sündüz", "Keleş", role = "aut"))
+Description: Estimates reliable, donor-specific gene co-expression
+    correlations from population-scale single-cell RNA-seq data. POPCORN
+    first fits a covariate-adjusted marginal model to correct technical
+    and compositional noise within each donor's own cells, then applies
+    a random-effects variance decomposition that separates genuine
+    between-donor heterogeneity from sampling noise at each gene pair,
+    adaptively shrinking noisy donor-level estimates toward the global
+    correlation using information borrowed jointly across donors.
+License: MIT + file LICENSE
+URL: https://github.com/keleslab/popcorn
+BugReports: https://github.com/keleslab/popcorn/issues
+Encoding: UTF-8
+Roxygen: list(markdown = TRUE)
+Imports:
+    gamlss.dist,
+    Matrix,
+    parallel,
+    qvalue,
+    R.utils,
+    RhpcBLASctl,
+    scDesign3,
+    SingleCellExperiment,
+    SummarizedExperiment,
+    stats,
+    utils
+Suggests:
+    knitr,
+    rmarkdown,
+    sessioninfo,
+    testthat (>= 3.0.0)
+Depends:
+    R (>= 4.3)
+Remotes:
+    SONGDONGYUAN1994/scDesign3
+biocViews:
+Config/testthat/edition: 3
+VignetteBuilder: knitr
+Config/roxygen2/version: 8.1.0
