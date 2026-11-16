@@ -61,4 +61,4 @@ Shuchen Yan, Kris Sankaran, Sündüz Keleş.
 
 ## License
 
-MIT + file [LICENSE](LICENSE).
+MIT; see [LICENSE](LICENSE).
